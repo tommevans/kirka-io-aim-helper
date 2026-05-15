@@ -8,6 +8,8 @@ Lightweight macOS overlay for Safari FPS games (for example [kirka.io](https://k
 - Limits the overlay to the active Safari window instead of your full display.
 - Uses click-through rendering, so Safari still receives mouse and keyboard input.
 - Hides automatically when Safari is not the frontmost app.
+- Turns `Z` into a large-jump toggle while Safari is frontmost: press once
+  to repeatedly emit Space then left Shift, and press again to stop.
 
 ## Defaults
 
@@ -59,3 +61,5 @@ python3 crosshair_overlay.py --opacity 0.2 --thickness 2 --color "#00FF88" --off
 
 - If nothing appears, make sure Safari is the active/frontmost app.
 - If window tracking is inaccurate, grant Screen Recording permission to your terminal/python host in `System Settings -> Privacy & Security -> Screen Recording`.
+- If the `Z` jump helper does not trigger, grant Accessibility permission
+  to your terminal/python host in `System Settings -> Privacy & Security -> Accessibility`.

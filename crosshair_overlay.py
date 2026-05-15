@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import signal
 import sys
+import time
 from dataclasses import dataclass
 
 
@@ -102,6 +103,7 @@ def parse_args(argv: list[str]) -> OverlayConfig:
 
 def run_overlay(config: OverlayConfig) -> int:
     try:
+        import CoreFoundation
         import Quartz
         import objc
         from AppKit import (
@@ -139,6 +141,12 @@ def run_overlay(config: OverlayConfig) -> int:
         config.rgb[2] / 255.0,
         config.opacity,
     )
+    jump_toggle_keycode = 6
+    left_shift_keycode = 56
+    space_keycode = 49
+    jump_shift_delay_seconds = 0.012
+    jump_key_press_seconds = 0.018
+    jump_repeat_interval_seconds = 0.095
 
     class CrosshairView(objc.lookUpClass("NSView")):
         line_color = overlay_color
@@ -185,11 +193,17 @@ def run_overlay(config: OverlayConfig) -> int:
             self.window = None
             self.view = None
             self.refresh_timer = None
+            self.jump_event_tap = None
+            self.jump_event_callback = None
+            self.jump_event_source = None
+            self.jump_repeat_timer = None
+            self.jump_repeat_enabled = False
             return self
 
         def applicationDidFinishLaunching_(self, _notification):
             self._create_status_item()
             self._create_overlay_window()
+            self._create_jump_event_tap()
             self.refreshOverlay_(None)
             self.refresh_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 0.12,
@@ -209,12 +223,60 @@ def run_overlay(config: OverlayConfig) -> int:
             if self.refresh_timer is not None:
                 self.refresh_timer.invalidate()
                 self.refresh_timer = None
+            self._stop_jump_repeat()
+            if self.jump_event_tap is not None:
+                Quartz.CGEventTapEnable(self.jump_event_tap, False)
+                self.jump_event_tap = None
+                self.jump_event_callback = None
+                self.jump_event_source = None
 
         def screenConfigChanged_(self, _notification):
             self.refreshOverlay_(None)
 
         def quitOverlay_(self, _sender):
             NSApplication.sharedApplication().terminate_(None)
+
+        def handleJumpEvent_type_event_(self, _proxy, event_type, event):
+            if event_type in (
+                Quartz.kCGEventTapDisabledByTimeout,
+                Quartz.kCGEventTapDisabledByUserInput,
+            ):
+                if self.jump_event_tap is not None:
+                    Quartz.CGEventTapEnable(self.jump_event_tap, True)
+                return event
+
+            if event_type not in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
+                return event
+
+            keycode = Quartz.CGEventGetIntegerValueField(
+                event,
+                Quartz.kCGKeyboardEventKeycode,
+            )
+            if int(keycode) != jump_toggle_keycode:
+                return event
+
+            if self._frontmost_safari_pid() is None:
+                return event
+
+            if event_type == Quartz.kCGEventKeyUp:
+                return None
+
+            is_repeat = bool(
+                Quartz.CGEventGetIntegerValueField(
+                    event,
+                    Quartz.kCGKeyboardEventAutorepeat,
+                )
+            )
+            if is_repeat:
+                return None
+
+            if self.jump_repeat_enabled:
+                self._disable_jump_repeat()
+            else:
+                self.jump_repeat_enabled = True
+                self._emit_jump_sequence()
+                self._start_jump_repeat()
+            return None
 
         def _window_level(self):
             key = getattr(Quartz, "kCGScreenSaverWindowLevelKey", None)
@@ -252,6 +314,87 @@ def run_overlay(config: OverlayConfig) -> int:
             )
             self.window.setContentView_(self.view)
             self.window.orderOut_(None)
+
+        def _create_jump_event_tap(self):
+            event_mask = (
+                Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
+                | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp)
+            )
+
+            def callback(proxy, event_type, event, _refcon):
+                return self.handleJumpEvent_type_event_(proxy, event_type, event)
+
+            self.jump_event_callback = callback
+            self.jump_event_tap = Quartz.CGEventTapCreate(
+                Quartz.kCGSessionEventTap,
+                Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionDefault,
+                event_mask,
+                self.jump_event_callback,
+                None,
+            )
+            if self.jump_event_tap is None:
+                print(
+                    "Could not install keyboard event tap. Grant Accessibility "
+                    "permission to your terminal/python host, then restart.",
+                    file=sys.stderr,
+                )
+                return
+
+            self.jump_event_source = CoreFoundation.CFMachPortCreateRunLoopSource(
+                None,
+                self.jump_event_tap,
+                0,
+            )
+            CoreFoundation.CFRunLoopAddSource(
+                CoreFoundation.CFRunLoopGetCurrent(),
+                self.jump_event_source,
+                CoreFoundation.kCFRunLoopCommonModes,
+            )
+            Quartz.CGEventTapEnable(self.jump_event_tap, True)
+
+        def _start_jump_repeat(self):
+            if self.jump_repeat_timer is not None:
+                return
+            self.jump_repeat_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                jump_repeat_interval_seconds,
+                self,
+                "repeatJump:",
+                None,
+                True,
+            )
+
+        def _stop_jump_repeat(self):
+            if self.jump_repeat_timer is not None:
+                self.jump_repeat_timer.invalidate()
+                self.jump_repeat_timer = None
+
+        def _disable_jump_repeat(self):
+            self.jump_repeat_enabled = False
+            self._stop_jump_repeat()
+
+        def repeatJump_(self, _timer):
+            if not self.jump_repeat_enabled or self._frontmost_safari_pid() is None:
+                self._disable_jump_repeat()
+                return
+            self._emit_jump_sequence()
+
+        def _post_key(self, keycode, is_down):
+            event = Quartz.CGEventCreateKeyboardEvent(None, keycode, is_down)
+            if event is None:
+                return
+            Quartz.CGEventSetFlags(event, 0)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+        def _tap_key(self, keycode):
+            self._post_key(keycode, True)
+            time.sleep(jump_key_press_seconds)
+            self._post_key(keycode, False)
+
+        def _emit_jump_sequence(self):
+            self._tap_key(space_keycode)
+            time.sleep(jump_shift_delay_seconds)
+            self._tap_key(left_shift_keycode)
 
         def _frontmost_safari_pid(self):
             app = NSWorkspace.sharedWorkspace().frontmostApplication()
